@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"strings"
@@ -124,23 +125,37 @@ func main() {
 
 	auth := router.Group("/api/auth")
 	{
+		db, err := sql.Open("sqlite", "./app.db")
+		if err != nil {
+			panic(err)
+		}
+		defer db.Close()
 		auth.POST("/register", func(c *gin.Context) {
 			var request RegisterRequest
 			if err := c.ShouldBindJSON(&request); err != nil {
 				c.JSON(http.StatusBadRequest, gin.H{"message": "invalid register request"})
 				return
 			}
-
-			c.JSON(http.StatusAccepted, gin.H{
-				"message": "dummy register handler",
-				"todo":    "replace with actual signup validation and insert query",
-				"user": gin.H{
-					"username": request.Username,
-					"name":     request.Name,
-					"email":    request.Email,
-					"phone":    request.Phone,
-				},
-			})
+			tx, err := db.Begin()
+			if err != nil {
+				c.JSON(500, gin.H{"err": "tx 시작 실패"})
+				return
+			}
+			_, err = tx.Exec("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, name TEXT, email TEXT, phone TEXT, password TEXT)")
+			if err != nil {
+				c.JSON(500, gin.H{"err": "테이블 생성 실패"})
+			}
+			defer tx.Rollback()
+			_, err = tx.Exec("INSERT INTO users (username, name, email, phone, password) VALUES (?, ?, ?, ?, ?)", request.Username, request.Name, request.Email, request.Phone, request.Password)
+			if err != nil {
+				c.JSON(500, gin.H{"err": "사용자 생성 실패"})
+				return
+			}
+			err = tx.Commit()
+			if err != nil {
+				c.JSON(500, gin.H{"err": "커밋 실패"})
+				return
+			}
 		})
 
 		auth.POST("/login", func(c *gin.Context) {
@@ -171,7 +186,6 @@ func main() {
 			c.JSON(http.StatusOK, LoginResponse{
 				AuthMode: "header-and-cookie",
 				Token:    token,
-				User:     makeUserResponse(user),
 			})
 		})
 
@@ -188,40 +202,46 @@ func main() {
 
 			sessions.delete(token)
 			clearAuthorizationCookie(c)
-			c.JSON(http.StatusOK, gin.H{
-				"message": "dummy logout handler",
-				"todo":    "replace with revoke or audit logic if needed",
-			})
+			c.JSON(http.StatusOK, gin.H{"message": "logged out successfully"})
 		})
 
-		auth.POST("/withdraw", func(c *gin.Context) {
+		auth.POST("/withdraw", func(c *gin.Context) { //회원 탈퇴는 로그인한 이후에만 가능
 			var request WithdrawAccountRequest
 			if err := c.ShouldBindJSON(&request); err != nil {
 				c.JSON(http.StatusBadRequest, gin.H{"message": "invalid withdraw request"})
 				return
 			}
-
-			token := tokenFromRequest(c)
+			token := tokenFromRequest(c) //로그인한 사용자의 토큰
 			if token == "" {
 				c.JSON(http.StatusUnauthorized, gin.H{"message": "missing authorization token"})
 				return
 			}
-			user, ok := sessions.lookup(token)
-			if !ok {
-				c.JSON(http.StatusUnauthorized, gin.H{"message": "invalid authorization token"})
+			sessions.delete(token)
+			clearAuthorizationCookie(c)
+			tx, err := db.Begin()
+			if err != nil {
+				c.JSON(500, gin.H{"err": "tx 시작 실패"})
 				return
 			}
-
-			c.JSON(http.StatusAccepted, gin.H{
-				"message": "dummy withdraw handler",
-				"todo":    "replace with password check and account delete logic",
-				"user":    makeUserResponse(user),
-			})
+			_, err = tx.Exec("DELETE FROM users WHERE password=?", request.Password)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"message": "failed to delete account"})
+				return
+			}
+			err = tx.Commit()
+			if err != nil {
+				c.JSON(500, gin.H{"err": "커밋 실패"})
+				return
+			}
 		})
 	}
 
 	protected := router.Group("/api")
 	{
+		db, err := sql.Open("sqlite", "./app.db")
+		if err != nil {
+			panic(err)
+		}
 		protected.GET("/me", func(c *gin.Context) {
 			token := tokenFromRequest(c)
 			if token == "" {
@@ -237,7 +257,7 @@ func main() {
 			c.JSON(http.StatusOK, gin.H{"user": makeUserResponse(user)})
 		})
 
-		protected.POST("/banking/deposit", func(c *gin.Context) {
+		protected.POST("/banking/deposit", func(c *gin.Context) { //입금
 			var request DepositRequest
 			if err := c.ShouldBindJSON(&request); err != nil {
 				c.JSON(http.StatusBadRequest, gin.H{"message": "invalid deposit request"})
@@ -254,16 +274,34 @@ func main() {
 				c.JSON(http.StatusUnauthorized, gin.H{"message": "invalid authorization token"})
 				return
 			}
+			tx, err := db.Begin()
+			if err != nil {
+				c.JSON(500, gin.H{"err": "tx 시작 실패"})
+				return
+			}
+			_, err = tx.Exec(`CREATE TABLE IF NOT EXISTS accounts (id INTEGER PRIMARY KEY AUTOINCREMENT, balance INTEGER)`)
+			if err != nil {
+				c.JSON(500, gin.H{"err": "테이블 생성 실패"})
+				return
+			}
+			defer tx.Rollback()
+			_, err = tx.Exec(`INSERT INTO accounts (id, balance) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET balance = balance + ?`, user.ID, request.Amount, request.Amount)
+			if err != nil {
+				c.JSON(500, gin.H{"err": "입금 실패"})
+				return
+			}
+			err = tx.Commit()
+			if err != nil {
+				c.JSON(500, gin.H{"err": "커밋 실패"})
+				return
+			}
 
 			c.JSON(http.StatusOK, gin.H{
-				"message": "dummy deposit handler",
-				"todo":    "replace with balance increment query",
-				"user":    makeUserResponse(user),
-				"amount":  request.Amount,
+				"amount": request.Amount,
 			})
 		})
 
-		protected.POST("/banking/withdraw", func(c *gin.Context) {
+		protected.POST("/banking/withdraw", func(c *gin.Context) { //출금
 			var request BalanceWithdrawRequest
 			if err := c.ShouldBindJSON(&request); err != nil {
 				c.JSON(http.StatusBadRequest, gin.H{"message": "invalid withdraw request"})
@@ -280,16 +318,28 @@ func main() {
 				c.JSON(http.StatusUnauthorized, gin.H{"message": "invalid authorization token"})
 				return
 			}
+			tx, err := db.Begin()
+			if err != nil {
+				c.JSON(500, gin.H{"err": "tx 시작 실패"})
+				return
+			}
+			_, err = tx.Exec(`UPDATE accounts SET balance = balance - ? WHERE id = ?`, request.Amount, user.ID)
+			if err != nil {
+				c.JSON(500, gin.H{"err": "출금 실패"})
+				return
+			}
+			err = tx.Commit()
+			if err != nil {
+				c.JSON(500, gin.H{"err": "커밋 실패"})
+				return
+			}
 
 			c.JSON(http.StatusOK, gin.H{
-				"message": "dummy withdraw handler",
-				"todo":    "replace with balance check and decrement query",
-				"user":    makeUserResponse(user),
-				"amount":  request.Amount,
+				"amount": request.Amount,
 			})
 		})
 
-		protected.POST("/banking/transfer", func(c *gin.Context) {
+		protected.POST("/banking/transfer", func(c *gin.Context) { //송금
 			var request TransferRequest
 			if err := c.ShouldBindJSON(&request); err != nil {
 				c.JSON(http.StatusBadRequest, gin.H{"message": "invalid transfer request"})
@@ -306,13 +356,25 @@ func main() {
 				c.JSON(http.StatusUnauthorized, gin.H{"message": "invalid authorization token"})
 				return
 			}
-
+			tx, err := db.Begin()
+			if err != nil {
+				c.JSON(500, gin.H{"err": "tx 시작 실패"})
+				return
+			}
+			_, err = tx.Exec(`UPDATE accounts SET balance = balance - ? WHERE id = ?`, request.Amount, user.ID)
+			if err != nil {
+				c.JSON(500, gin.H{"err": "송금 실패"})
+				return
+			}
+			defer tx.Rollback()
+			_, err = tx.Exec(`UPDATE accounts SET balance = balance + ? WHERE id = (SELECT id FROM users WHERE username = ?)`, request.Amount, request.ToUsername)
+			if err != nil {
+				c.JSON(500, gin.H{"err": "송금 실패"})
+				return
+			}
 			c.JSON(http.StatusOK, gin.H{
-				"message": "dummy transfer handler",
-				"todo":    "replace with transfer transaction and balance checks",
-				"user":    makeUserResponse(user),
-				"target":  request.ToUsername,
-				"amount":  request.Amount,
+				"target": request.ToUsername,
+				"amount": request.Amount,
 			})
 		})
 
@@ -326,20 +388,29 @@ func main() {
 				c.JSON(http.StatusUnauthorized, gin.H{"message": "invalid authorization token"})
 				return
 			}
+			db, err := sql.Open("sqlite", "./app.db")
+			if err != nil {
+				c.JSON(500, gin.H{"err": "db 연결 실패"})
+				return
+			}
+			defer db.Close()
+			rows, err := db.Query(`SELECT id, title, content, owner_id, created_at, updated_at FROM posts`)
+			if err != nil {
+				c.JSON(500, gin.H{"err": "게시물 조회 실패", "detail": err.Error()})
+				return
+			}
+			posts := []PostView{}
+			for rows.Next() {
+				var post PostView
+				if err := rows.Scan(&post.ID, &post.Title, &post.Content, &post.OwnerID, &post.CreatedAt, &post.UpdatedAt); err != nil {
+					c.JSON(500, gin.H{"err": "게시물 스캔 실패", "detail": err.Error()})
+					return
+				}
+				posts = append(posts, post)
+			}
 
 			c.JSON(http.StatusOK, PostListResponse{
-				Posts: []PostView{
-					{
-						ID:          1,
-						Title:       "Dummy Post",
-						Content:     "This is a fixed dummy response. Replace this later with real board logic.",
-						OwnerID:     1,
-						Author:      "Alice Admin",
-						AuthorEmail: "alice.admin@example.com",
-						CreatedAt:   "2026-03-19T09:00:00Z",
-						UpdatedAt:   "2026-03-19T09:00:00Z",
-					},
-				},
+				Posts: posts,
 			})
 		})
 
@@ -362,18 +433,40 @@ func main() {
 			}
 
 			now := time.Now().Format(time.RFC3339)
+			db, err := sql.Open("sqlite", "./app.db")
+
+			tx, err := db.Begin()
+			if err != nil {
+				c.JSON(500, gin.H{"err": "tx 시작 실패"})
+				return
+			}
+			_, err = tx.Exec(`CREATE TABLE IF NOT EXISTS posts (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, content TEXT, owner_id INTEGER, created_at TEXT, updated_at TEXT)`)
+			if err != nil {
+				print(err.Error)
+				return
+			}
+			defer tx.Rollback()
+			_, err = tx.Exec(`INSERT INTO posts (title, content, owner_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`, request.Title, request.Content, user.ID, now, now)
+			if err != nil {
+				c.JSON(500, gin.H{"err": err.Error()})
+				return
+			}
+			err = tx.Commit()
+			if err != nil {
+				c.JSON(500, gin.H{"err": "커밋 실패"})
+				return
+			}
+
 			c.JSON(http.StatusCreated, gin.H{
 				"message": "dummy create post handler",
 				"todo":    "replace with insert query",
 				"post": PostView{
-					ID:          1,
-					Title:       strings.TrimSpace(request.Title),
-					Content:     strings.TrimSpace(request.Content),
-					OwnerID:     user.ID,
-					Author:      user.Name,
-					AuthorEmail: user.Email,
-					CreatedAt:   now,
-					UpdatedAt:   now,
+					ID:        1,
+					Title:     strings.TrimSpace(request.Title),
+					Content:   strings.TrimSpace(request.Content),
+					OwnerID:   user.ID,
+					CreatedAt: now,
+					UpdatedAt: now,
 				},
 			})
 		})
@@ -388,17 +481,33 @@ func main() {
 				c.JSON(http.StatusUnauthorized, gin.H{"message": "invalid authorization token"})
 				return
 			}
+			db, err := sql.Open("sqlite", "./app.db")
+			if err != nil {
+				c.JSON(500, gin.H{"err": "db 연결 실패"})
+				return
+			}
+			defer db.Close()
+
+			row := db.QueryRow(`SELECT id, title, content, owner_id, created_at, updated_at FROM posts WHERE id = ?`, c.Param("id"))
+
+			var post PostView
+			if err := row.Scan(&post.ID, &post.Title, &post.Content, &post.OwnerID, &post.CreatedAt, &post.UpdatedAt); err != nil {
+				if err == sql.ErrNoRows {
+					c.JSON(404, gin.H{"err": "게시물이 없습니다"})
+					return
+				}
+				c.JSON(500, gin.H{"err": "게시물 조회 실패", "detail": err.Error()})
+				return
+			}
 
 			c.JSON(http.StatusOK, PostResponse{
 				Post: PostView{
-					ID:          1,
-					Title:       "Dummy Post",
-					Content:     "This is a fixed dummy response. Replace this later with real board logic.",
-					OwnerID:     1,
-					Author:      "Alice Admin",
-					AuthorEmail: "alice.admin@example.com",
-					CreatedAt:   "2026-03-19T09:00:00Z",
-					UpdatedAt:   "2026-03-19T09:00:00Z",
+					ID:        post.ID,
+					Title:     post.Title,
+					Content:   post.Content,
+					OwnerID:   post.OwnerID,
+					CreatedAt: post.CreatedAt,
+					UpdatedAt: post.UpdatedAt,
 				},
 			})
 		})
@@ -420,20 +529,40 @@ func main() {
 				c.JSON(http.StatusUnauthorized, gin.H{"message": "invalid authorization token"})
 				return
 			}
-
 			now := time.Now().Format(time.RFC3339)
+
+			db, err := sql.Open("sqlite", "./app.db")
+			if err != nil {
+				c.JSON(500, gin.H{"err": "db 연결 실패"})
+				return
+			}
+			tx, err := db.Begin()
+			if err != nil {
+				c.JSON(500, gin.H{"err": "tx 시작 실패"})
+				return
+			}
+			fmt.Println(c.Param("id"))
+			_, err = tx.Exec(`UPDATE posts SET title =?, content = ?, updated_at = ? WHERE id = ?`, strings.TrimSpace(request.Title), strings.TrimSpace(request.Content), now, c.Param("id"))
+			if err != nil {
+				c.JSON(500, gin.H{"err": "수정 요청 실패"})
+				return
+			}
+			err = tx.Commit()
+			if err != nil {
+				c.JSON(500, gin.H{"err": "커밋 실패"})
+				return
+			}
+
 			c.JSON(http.StatusOK, gin.H{
 				"message": "dummy update post handler",
 				"todo":    "replace with ownership check and update query",
 				"post": PostView{
-					ID:          1,
-					Title:       strings.TrimSpace(request.Title),
-					Content:     strings.TrimSpace(request.Content),
-					OwnerID:     user.ID,
-					Author:      user.Name,
-					AuthorEmail: user.Email,
-					CreatedAt:   "2026-03-19T09:00:00Z",
-					UpdatedAt:   now,
+					ID:        1,
+					Title:     strings.TrimSpace(request.Title),
+					Content:   strings.TrimSpace(request.Content),
+					OwnerID:   user.ID,
+					CreatedAt: "2026-03-19T09:00:00Z",
+					UpdatedAt: now,
 				},
 			})
 		})
@@ -446,6 +575,27 @@ func main() {
 			}
 			if _, ok := sessions.lookup(token); !ok {
 				c.JSON(http.StatusUnauthorized, gin.H{"message": "invalid authorization token"})
+				return
+			}
+			db, err := sql.Open("sqlite", "./app.db")
+			if err != nil {
+				c.JSON(500, gin.H{"err": "db 연결 실패"})
+				return
+			}
+			tx, err := db.Begin()
+			if err != nil {
+				c.JSON(500, gin.H{"err": "tx 시작 실패"})
+				return
+			}
+			fmt.Println(c.Param("id"))
+			_, err = tx.Exec(`DELETE FROM posts WHERE id=?`, c.Param("id"))
+			if err != nil {
+				c.JSON(500, gin.H{"err": "수정 요청 실패"})
+				return
+			}
+			err = tx.Commit()
+			if err != nil {
+				c.JSON(500, gin.H{"err": "커밋 실패"})
 				return
 			}
 
